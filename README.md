@@ -189,6 +189,47 @@ Select the language in the sidebar before loading a video.
 
 ---
 
+## Deploying to Streamlit Cloud
+
+English videos with YouTube captions work out of the box on Streamlit Cloud.
+
+For Hindi (or any) videos **without YouTube captions**, Whisper needs to download the audio — but YouTube blocks audio downloads from cloud/datacenter IPs with a **HTTP 403 Forbidden** error. The fix is to authenticate the download using your YouTube cookies.
+
+### Step-by-step: adding YouTube cookies
+
+**1. Export your cookies**
+
+Install the browser extension **"Get cookies.txt LOCALLY"** (Chrome/Edge/Firefox).
+- Go to [youtube.com](https://youtube.com) while **logged in** to your Google account
+- Click the extension icon → select **"Export cookies for this tab"** → save as `cookies.txt`
+- Open the file and copy its full contents
+
+**2. Add to Streamlit Cloud secrets**
+
+In your app's Streamlit Cloud dashboard → **Settings → Secrets**, add:
+
+```toml
+YOUTUBE_COOKIES = """
+# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	FALSE	1234567890	CONSENT	YES+...
+... (paste the full contents of cookies.txt here)
+"""
+```
+
+**3. For local development**
+
+Add the same variable to your `.env` file:
+```
+YOUTUBE_COOKIES="# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	FALSE	..."
+```
+
+Once set, yt-dlp will authenticate with YouTube using your account session and the 403 error will not occur.
+
+> **Note:** Cookies expire periodically. If the 403 error returns, re-export your cookies and update the secret.
+
+---
+
 ## Limitations
 
 - **Whisper transcription is slow** for long videos — a 1-hour video may take 5–15 minutes on CPU depending on the model size
