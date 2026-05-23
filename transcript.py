@@ -288,48 +288,65 @@ def _whisper_transcribe(video_id: str, language: str | None, model_size: str) ->
         url = f"https://www.youtube.com/watch?v={video_id}"
         out_template = os.path.join(tmpdir, f"{video_id}.%(ext)s")
 
-        ydl_opts = {
-            # Prefer m4a (AAC) — smallest download, natively supported by Whisper.
-            # Falls back to any audio-only stream, then any stream.
+        # Base yt-dlp options
+        base_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": out_template,
-            # ── No postprocessors ──────────────────────────────────────────────
-            # FFmpegExtractAudio requires both ffmpeg AND ffprobe.
-            # imageio-ffmpeg only ships ffmpeg, so we skip conversion entirely
-            # and hand the native file straight to Whisper.
+            # No FFmpegExtractAudio postprocessor — imageio-ffmpeg has no ffprobe.
+            # We hand the native m4a/webm file straight to Whisper.
             "quiet": True,
             "no_warnings": True,
         }
         if ffmpeg_exe:
-            ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
+            base_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
 
-        # Attach cookies if provided (required on cloud deployments where
-        # YouTube returns HTTP 403 for datacenter IPs without authentication)
         cookies_file = _get_cookies_file()
         if cookies_file:
-            ydl_opts["cookiefile"] = cookies_file
+            base_opts["cookiefile"] = cookies_file
 
-        logger.info(f"Downloading audio for {video_id} via yt-dlp")
+        # YouTube periodically blocks the default (web) player client.
+        # Try multiple player clients in order — ios and android use different
+        # API endpoints that are typically not blocked.
+        player_clients = ["ios", "android", "web"]
+
         import yt_dlp
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except Exception as e:
-            err = str(e)
+        last_error: Exception | None = None
+        downloaded = False
+
+        for client in player_clients:
+            ydl_opts = {
+                **base_opts,
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            }
+            logger.info(f"Attempting yt-dlp download for {video_id} (player_client={client})")
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                downloaded = True
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"yt-dlp player_client={client} failed: {e}")
+                # Clean up any partial files before retrying
+                for f in glob.glob(os.path.join(tmpdir, f"{video_id}.*")):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+
+        if not downloaded:
+            err = str(last_error)
             if "403" in err or "Forbidden" in err:
                 raise RuntimeError(
-                    "YouTube blocked the audio download (HTTP 403 Forbidden).\n\n"
-                    "This happens on cloud deployments because YouTube blocks requests "
-                    "from datacenter IP addresses.\n\n"
-                    "Fix: export your YouTube cookies and set them as YOUTUBE_COOKIES "
-                    "in your Streamlit secrets (or .env file locally).\n"
-                    "See the README → 'Deploying to Streamlit Cloud' for step-by-step instructions."
+                    "YouTube blocked the audio download (HTTP 403 Forbidden) "
+                    "on all player clients (ios, android, web).\n\n"
+                    "Fix: export your YouTube cookies and set them as "
+                    "YOUTUBE_COOKIES in your .env file (locally) or Streamlit "
+                    "secrets (on cloud).\n"
+                    "See README → 'Deploying to Streamlit Cloud' for instructions."
                 ) from None
-            raise
-        finally:
-            if cookies_file:
-                os.unlink(cookies_file)
+            raise last_error
 
         # Locate the downloaded file (extension varies: m4a, webm, opus, …)
         audio_files = glob.glob(os.path.join(tmpdir, f"{video_id}.*"))
@@ -370,6 +387,8 @@ def _whisper_transcribe(video_id: str, language: str | None, model_size: str) ->
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        if cookies_file and os.path.exists(cookies_file):
+            os.unlink(cookies_file)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
