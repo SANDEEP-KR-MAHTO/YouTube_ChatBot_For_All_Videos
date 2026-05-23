@@ -13,6 +13,29 @@ from config import CHUNK_OVERLAP, CHUNK_SIZE, WHISPER_MODEL_SIZE
 logger = logging.getLogger(__name__)
 
 
+# ── YouTube cookies (needed on cloud deployments) ─────────────────────────────
+
+def _get_cookies_file() -> str | None:
+    """
+    Write YouTube cookies from the environment to a temp file for yt-dlp.
+
+    On Streamlit Cloud, set the secret YOUTUBE_COOKIES to the full contents
+    of a Netscape-format cookies.txt exported from your browser while logged
+    in to YouTube.  Locally, add the same variable to your .env file.
+
+    Returns the path to the temp file, or None if no cookies are configured.
+    The caller is responsible for deleting the file after use.
+    """
+    cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if not cookies:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="yt_cookies_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(cookies)
+    logger.info("Using YouTube cookies from environment for yt-dlp")
+    return path
+
+
 # ── ffmpeg auto-detection ─────────────────────────────────────────────────────
 
 def _patch_whisper_ffmpeg(ffmpeg_exe: str) -> None:
@@ -278,14 +301,35 @@ def _whisper_transcribe(video_id: str, language: str | None, model_size: str) ->
             "no_warnings": True,
         }
         if ffmpeg_exe:
-            # Tell yt-dlp where ffmpeg lives (used for any internal checks)
             ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
 
-        logger.info(f"Downloading audio for {video_id} via yt-dlp (no postprocessing)")
+        # Attach cookies if provided (required on cloud deployments where
+        # YouTube returns HTTP 403 for datacenter IPs without authentication)
+        cookies_file = _get_cookies_file()
+        if cookies_file:
+            ydl_opts["cookiefile"] = cookies_file
+
+        logger.info(f"Downloading audio for {video_id} via yt-dlp")
         import yt_dlp
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            err = str(e)
+            if "403" in err or "Forbidden" in err:
+                raise RuntimeError(
+                    "YouTube blocked the audio download (HTTP 403 Forbidden).\n\n"
+                    "This happens on cloud deployments because YouTube blocks requests "
+                    "from datacenter IP addresses.\n\n"
+                    "Fix: export your YouTube cookies and set them as YOUTUBE_COOKIES "
+                    "in your Streamlit secrets (or .env file locally).\n"
+                    "See the README → 'Deploying to Streamlit Cloud' for step-by-step instructions."
+                ) from None
+            raise
+        finally:
+            if cookies_file:
+                os.unlink(cookies_file)
 
         # Locate the downloaded file (extension varies: m4a, webm, opus, …)
         audio_files = glob.glob(os.path.join(tmpdir, f"{video_id}.*"))
