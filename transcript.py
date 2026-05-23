@@ -290,7 +290,7 @@ def _whisper_transcribe(video_id: str, language: str | None, model_size: str) ->
 
         # Base yt-dlp options
         base_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "format": "bestaudio/best",
             "outtmpl": out_template,
             # No FFmpegExtractAudio postprocessor — imageio-ffmpeg has no ffprobe.
             # We hand the native m4a/webm file straight to Whisper.
