@@ -1,3 +1,4 @@
+# ── Core RAG stack ────────────────────────────────────────────────────────────
 youtube-transcript-api
 langchain==0.3.25
 langchain-core
@@ -7,12 +8,16 @@ langchain-huggingface
 langchain-text-splitters
 sentence-transformers          # multilingual embeddings + CrossEncoder reranker
 faiss-cpu==1.9.0
+rank-bm25                      # BM25 keyword search
+
+# ── LLM / Transcription (Groq — all free tier) ───────────────────────────────
+groq                           # Groq SDK: LLM + Whisper audio transcription API
+
+# ── Audio download (Whisper fallback for caption-free videos) ────────────────
+yt-dlp                         # downloads YouTube audio for Groq Whisper fallback
+imageio-ffmpeg                 # bundles ffmpeg binaries — no manual install needed locally
+
+# ── App / utilities ───────────────────────────────────────────────────────────
 streamlit==1.45.1
 python-dotenv==1.1.0
-rank-bm25                      # BM25 keyword search
 tiktoken
-
-# ── Whisper fallback (needed only for videos without YouTube captions) ────────
-openai-whisper
-yt-dlp
-imageio-ffmpeg    # auto-downloads ffmpeg binaries — no manual install needed

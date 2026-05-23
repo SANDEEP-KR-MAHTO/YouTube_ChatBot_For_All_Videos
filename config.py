@@ -28,12 +28,12 @@ GROQ_MODELS = [
     "mixtral-8x7b-32768",
 ]
 
-# ── Whisper (local, free audio transcription fallback) ────────────────────────
+# ── Whisper fallback (Groq API — free tier) ───────────────────────────────────
 # Used when no YouTube captions are available for a video.
-# Requires: pip install openai-whisper yt-dlp  AND  ffmpeg on PATH
-# Size guide: tiny(~75MB)→fast/weak | base(~140MB) | small(~460MB)→good for Hindi
-#             medium(~1.5GB)→best Hindi | large(~3GB)→highest quality
-WHISPER_MODEL_SIZE = "small"
+# Audio is downloaded via yt-dlp, then sent to Groq's whisper-large-v3-turbo.
+# Requires: GROQ_API_KEY (same key used for the LLM) + yt-dlp + ffmpeg
+# File size limit: 25 MB (~30 min of typical YouTube audio)
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 # ── Language preferences ──────────────────────────────────────────────────────
 # Language codes tried in order when fetching YouTube captions.

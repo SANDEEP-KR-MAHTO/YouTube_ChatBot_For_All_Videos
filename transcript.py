@@ -3,29 +3,25 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 
 from youtube_transcript_api import YouTubeTranscriptApi
 
-from config import CHUNK_OVERLAP, CHUNK_SIZE, WHISPER_MODEL_SIZE
+from config import CHUNK_OVERLAP, CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
 
+# Groq's hard upload limit
+_GROQ_MAX_MB = 24.5
+# Split audio into chunks of this many minutes (well under the size limit)
+_SPLIT_MINUTES = 20
 
-# ── YouTube cookies (needed on cloud deployments) ─────────────────────────────
+
+# ── YouTube cookies (needed when YouTube blocks cloud IPs) ────────────────────
 
 def _get_cookies_file() -> str | None:
-    """
-    Write YouTube cookies from the environment to a temp file for yt-dlp.
-
-    On Streamlit Cloud, set the secret YOUTUBE_COOKIES to the full contents
-    of a Netscape-format cookies.txt exported from your browser while logged
-    in to YouTube.  Locally, add the same variable to your .env file.
-
-    Returns the path to the temp file, or None if no cookies are configured.
-    The caller is responsible for deleting the file after use.
-    """
     cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if not cookies:
         return None
@@ -34,98 +30,6 @@ def _get_cookies_file() -> str | None:
         f.write(cookies)
     logger.info("Using YouTube cookies from environment for yt-dlp")
     return path
-
-
-# ── ffmpeg auto-detection ─────────────────────────────────────────────────────
-
-def _patch_whisper_ffmpeg(ffmpeg_exe: str) -> None:
-    """
-    Replace whisper.audio.load_audio with a version that uses the absolute
-    ffmpeg path instead of relying on PATH lookup.
-
-    This is necessary on Windows where os.environ["PATH"] changes do not
-    reliably propagate to subprocesses already in flight.
-    """
-    try:
-        import numpy as np
-        import whisper.audio as _wa
-        from subprocess import CalledProcessError, run
-
-        _sr = _wa.SAMPLE_RATE
-
-        def _load_audio(file: str, sr: int = _sr) -> "np.ndarray":
-            cmd = [
-                ffmpeg_exe, "-nostdin", "-threads", "0",
-                "-i", file,
-                "-f", "s16le", "-ac", "1",
-                "-acodec", "pcm_s16le",
-                "-ar", str(sr),
-                "-",
-            ]
-            try:
-                out = run(cmd, capture_output=True, check=True).stdout
-            except CalledProcessError as e:
-                raise RuntimeError(
-                    f"ffmpeg failed to decode audio: {e.stderr.decode()}"
-                ) from e
-            return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
-
-        _wa.load_audio = _load_audio
-        logger.info(f"Patched whisper.audio.load_audio → {ffmpeg_exe}")
-    except Exception as e:
-        logger.warning(f"Could not patch whisper ffmpeg path: {e}")
-
-
-def _ensure_ffmpeg() -> str | None:
-    """
-    Locate ffmpeg and make it available to both yt-dlp and Whisper.
-
-    Priority:
-      1. System ffmpeg already on PATH  → return None
-      2. imageio-ffmpeg bundled binary  → patch Whisper to use it, return path
-      3. Neither available              → raise RuntimeError with install hint
-    """
-    import shutil as _shutil
-    if _shutil.which("ffmpeg"):
-        return None  # system ffmpeg is fine; both yt-dlp and Whisper will find it
-
-    try:
-        import imageio_ffmpeg  # type: ignore
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        # PATH update (helps yt-dlp on some systems)
-        ffmpeg_dir = os.path.dirname(exe)
-        if ffmpeg_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-        # Patch Whisper directly — reliable on Windows where PATH updates
-        # don't always propagate to subprocesses.
-        _patch_whisper_ffmpeg(exe)
-        logger.info(f"Using bundled ffmpeg from imageio-ffmpeg: {exe}")
-        return exe
-    except ImportError:
-        raise RuntimeError(
-            "ffmpeg not found and imageio-ffmpeg is not installed.\n"
-            "Fix (no manual install needed):  pip install imageio-ffmpeg\n"
-            "Or manually: https://ffmpeg.org → add ffmpeg/bin to PATH."
-        )
-
-
-# ── Whisper model singleton ───────────────────────────────────────────────────
-_whisper_cache: dict = {}
-
-
-def _get_whisper_model(model_size: str):
-    if model_size not in _whisper_cache:
-        try:
-            import whisper
-        except ImportError:
-            raise RuntimeError(
-                "openai-whisper is not installed. Run:\n"
-                "  pip install openai-whisper\n"
-                "Also make sure ffmpeg is on your PATH."
-            )
-        logger.info(f"Loading Whisper model '{model_size}' (downloads once on first use)")
-        _whisper_cache[model_size] = whisper.load_model(model_size)
-    return _whisper_cache[model_size]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -197,32 +101,23 @@ def _snippets_to_chunks(snippets: list, video_id: str) -> list[dict]:
     return chunks
 
 
-# ── YouTube transcript fetch ───────────────────────────────────────────────────
+# ── YouTube caption fetch ─────────────────────────────────────────────────────
 
 def _fetch_youtube_snippets(video_id: str, preferred_langs: list[str]) -> list | None:
     """
     Try to fetch YouTube captions with language preference.
-    Returns a list of snippet objects, or None if unavailable.
-
-    Strategy:
-      1. list_transcripts → find manual transcript in preferred langs
-      2. list_transcripts → find auto-generated transcript in preferred langs
-      3. list_transcripts → take whatever is available (first transcript)
-      4. Plain api.fetch() as final fallback
+    Returns snippet objects or None if unavailable.
     """
-    # ── Attempt 1-3: language-aware via list_transcripts ──────────────────────
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
         transcript = None
-        # Try manual transcript in preferred languages
         try:
             transcript = transcript_list.find_manually_created_transcript(preferred_langs)
             logger.info(f"Found manual transcript: lang={transcript.language_code}")
         except Exception:
             pass
 
-        # Try auto-generated in preferred languages
         if transcript is None:
             try:
                 transcript = transcript_list.find_generated_transcript(preferred_langs)
@@ -230,14 +125,10 @@ def _fetch_youtube_snippets(video_id: str, preferred_langs: list[str]) -> list |
             except Exception:
                 pass
 
-        # Take the first available transcript regardless of language
         if transcript is None:
             try:
                 transcript = next(iter(transcript_list))
-                logger.info(
-                    f"No preferred-language transcript found; "
-                    f"using first available: lang={transcript.language_code}"
-                )
+                logger.info(f"Using first available transcript: lang={transcript.language_code}")
             except StopIteration:
                 pass
 
@@ -245,9 +136,8 @@ def _fetch_youtube_snippets(video_id: str, preferred_langs: list[str]) -> list |
             return list(transcript.fetch())
 
     except Exception as e:
-        logger.debug(f"list_transcripts approach failed: {e}")
+        logger.debug(f"list_transcripts failed: {e}")
 
-    # ── Attempt 4: plain fetch (gets the default transcript) ──────────────────
     try:
         api = YouTubeTranscriptApi()
         snippets = list(api.fetch(video_id))
@@ -259,136 +149,310 @@ def _fetch_youtube_snippets(video_id: str, preferred_langs: list[str]) -> list |
     return None
 
 
-# ── Whisper fallback ──────────────────────────────────────────────────────────
+# ── Audio download via yt-dlp ─────────────────────────────────────────────────
 
-def _whisper_transcribe(video_id: str, language: str | None, model_size: str) -> list:
+def _download_audio(video_id: str, out_dir: str) -> str:
     """
-    Download YouTube audio with yt-dlp and transcribe locally with Whisper.
-    Returns snippet-like objects compatible with _snippets_to_chunks().
+    Download the lowest-bitrate audio available for a YouTube video.
 
-    Requirements: pip install openai-whisper yt-dlp imageio-ffmpeg
-                  (imageio-ffmpeg auto-downloads ffmpeg; no manual install needed)
+    Using worstaudio (typically 48–64 kbps) keeps most videos under Groq's
+    25 MB limit:
+        48 kbps × 1 h  =  ~21 MB  ✓
+        48 kbps × 90 m =  ~32 MB  → auto-split before sending to Groq
     """
     try:
-        import yt_dlp  # noqa: F401
-    except ImportError:
-        raise RuntimeError(
-            "yt-dlp is not installed. Run:\n  pip install yt-dlp"
-        )
-
-    # Ensure ffmpeg is available (needed by Whisper for audio decoding).
-    # imageio-ffmpeg provides only ffmpeg — NOT ffprobe.
-    # We therefore skip yt-dlp's FFmpegExtractAudio postprocessor (which needs
-    # both) and download the audio in its native container format instead.
-    # Whisper can decode m4a/webm/opus directly using just ffmpeg.
-    ffmpeg_exe = _ensure_ffmpeg()
-
-    tmpdir = tempfile.mkdtemp()
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        out_template = os.path.join(tmpdir, f"{video_id}.%(ext)s")
-
-        # Base yt-dlp options
-        base_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": out_template,
-            # No FFmpegExtractAudio postprocessor — imageio-ffmpeg has no ffprobe.
-            # We hand the native m4a/webm file straight to Whisper.
-            "quiet": True,
-            "no_warnings": True,
-        }
-        if ffmpeg_exe:
-            base_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_exe)
-
-        cookies_file = _get_cookies_file()
-        if cookies_file:
-            base_opts["cookiefile"] = cookies_file
-
-        # YouTube periodically blocks the default (web) player client.
-        # Try multiple player clients in order — ios and android use different
-        # API endpoints that are typically not blocked.
-        player_clients = ["ios", "android", "web"]
-
         import yt_dlp
+    except ImportError:
+        raise RuntimeError("yt-dlp is not installed. Run: pip install yt-dlp")
 
-        last_error: Exception | None = None
-        downloaded = False
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    out_template = os.path.join(out_dir, f"{video_id}.%(ext)s")
 
+    # Prefer the smallest audio format available.
+    # worstaudio picks the lowest-bitrate audio-only stream — usually webm/opus
+    # at ~48-64 kbps, which is plenty for speech transcription.
+    # Explicit ext preferences ensure we get a container Groq can decode
+    # without ffmpeg post-processing.
+    format_string = (
+        "worstaudio[ext=webm]"
+        "/worstaudio[ext=m4a]"
+        "/worstaudio"
+        "/bestaudio[ext=m4a]"
+        "/bestaudio[ext=webm]"
+        "/bestaudio"
+        "/best[height<=144]"
+        "/best"
+    )
+
+    base_opts: dict = {
+        "format": format_string,
+        "outtmpl": out_template,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    cookies_file = _get_cookies_file()
+    if cookies_file:
+        base_opts["cookiefile"] = cookies_file
+
+    # mweb (mobile web) often bypasses datacenter-IP blocks that affect the
+    # desktop web client. Try it first, then fall back in order.
+    player_clients = ["mweb", "ios", "android", "web"]
+
+    last_error: Exception | None = None
+
+    try:
         for client in player_clients:
-            ydl_opts = {
+            opts = {
                 **base_opts,
-                "extractor_args": {"youtube": {"player_client": [client]}},
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": [client],
+                        "skip": ["hls"],  # HLS streams require ffmpeg to merge; skip
+                    }
+                },
             }
-            logger.info(f"Attempting yt-dlp download for {video_id} (player_client={client})")
+            logger.info(f"yt-dlp download attempt: player_client={client}")
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
-                downloaded = True
-                break
-            except Exception as e:
-                last_error = e
-                logger.warning(f"yt-dlp player_client={client} failed: {e}")
-                # Clean up any partial files before retrying
-                for f in glob.glob(os.path.join(tmpdir, f"{video_id}.*")):
+
+                audio_files = glob.glob(os.path.join(out_dir, f"{video_id}.*"))
+                if audio_files:
+                    logger.info(f"Downloaded: {audio_files[0]}")
+                    return audio_files[0]
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"yt-dlp player_client={client} failed: {exc}")
+                for f in glob.glob(os.path.join(out_dir, f"{video_id}.*")):
                     try:
                         os.remove(f)
                     except OSError:
                         pass
 
-        if not downloaded:
-            err = str(last_error)
-            if any(k in err for k in ("403", "Forbidden", "Sign in", "bot", "cookies")):
-                raise RuntimeError(
-                    "YouTube blocked the audio download (HTTP 403 Forbidden) "
-                    "on all player clients (ios, android, web).\n\n"
-                    "Fix: export your YouTube cookies and set them as "
-                    "YOUTUBE_COOKIES in your .env file (locally) or Streamlit "
-                    "secrets (on cloud).\n"
-                    "See README → 'Deploying to Streamlit Cloud' for instructions."
-                ) from None
-            raise last_error
+    finally:
+        if cookies_file and os.path.exists(cookies_file):
+            try:
+                os.unlink(cookies_file)
+            except OSError:
+                pass
 
-        # Locate the downloaded file (extension varies: m4a, webm, opus, …)
-        audio_files = glob.glob(os.path.join(tmpdir, f"{video_id}.*"))
-        if not audio_files:
-            raise RuntimeError("yt-dlp downloaded nothing — check your internet connection.")
-        audio_path = audio_files[0]
-
-        # Transcribe
-        model = _get_whisper_model(model_size)
-        whisper_kwargs: dict = {"task": "transcribe", "verbose": False}
-        if language:
-            whisper_kwargs["language"] = language
-
-        logger.info(
-            f"Transcribing with Whisper ({model_size}), "
-            f"language={'auto' if language is None else language}"
+    err = str(last_error or "")
+    if any(k in err for k in ("403", "Forbidden", "Sign in", "bot", "cookies", "blocked")):
+        raise RuntimeError(
+            "YouTube blocked the audio download from this server's IP address.\n\n"
+            "This video has no YouTube captions, so the app tried to download its "
+            "audio for Groq Whisper transcription — but YouTube blocks cloud datacenter IPs.\n\n"
+            "Fix: export your YouTube cookies and add them as YOUTUBE_COOKIES in "
+            "Streamlit secrets (see README for step-by-step instructions)."
         )
-        result = model.transcribe(audio_path, **whisper_kwargs)
+    if last_error:
+        raise RuntimeError(f"Audio download failed: {last_error}") from last_error
+    raise RuntimeError("Audio download failed: no file was produced.")
 
-        detected = result.get("language", language or "?")
-        segments = result.get("segments", [])
-        logger.info(
-            f"Whisper finished: {len(segments)} segments, "
-            f"detected_language={detected}"
+
+# ── ffmpeg resolution ─────────────────────────────────────────────────────────
+
+def _get_ffmpeg_exe() -> str:
+    """
+    Return a path to an ffmpeg executable.
+
+    Priority:
+      1. System ffmpeg already on PATH  (works on Streamlit Cloud via packages.txt)
+      2. imageio-ffmpeg bundled binary  (works locally — no manual install needed)
+    """
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        logger.info(f"Using bundled ffmpeg from imageio-ffmpeg: {exe}")
+        return exe
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "ffmpeg not found.\n"
+        "It is installed automatically on Streamlit Cloud via packages.txt.\n"
+        "Locally, run:  pip install imageio-ffmpeg  (no manual install needed)."
+    )
+
+
+# ── Audio re-encoding + splitting (for files > Groq's 25 MB limit) ───────────
+
+def _reencode_audio(audio_path: str, out_dir: str) -> str:
+    """
+    Re-encode audio to 32 kbps mono mp3.
+
+    At 32 kbps a 20-minute chunk is ~5 MB — well inside Groq's 25 MB limit
+    regardless of the original download quality.
+    """
+    ffmpeg = _get_ffmpeg_exe()
+    out_path = os.path.join(out_dir, "reencoded.mp3")
+    subprocess.run(
+        [
+            ffmpeg, "-i", audio_path,
+            "-ac", "1",        # mono
+            "-ab", "32k",      # 32 kbps — adequate for speech transcription
+            "-y", out_path,
+        ],
+        check=True,
+        capture_output=True,
+    )
+    new_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info(f"Re-encoded audio to 32 kbps mono: {new_mb:.1f} MB")
+    return out_path
+
+
+def _split_audio(audio_path: str, out_dir: str, chunk_minutes: int = _SPLIT_MINUTES) -> list[str]:
+    """
+    Split an audio file into fixed-duration chunks using ffmpeg.
+    Returns sorted list of chunk file paths.
+    """
+    ffmpeg = _get_ffmpeg_exe()
+    ext = os.path.splitext(audio_path)[1]
+    chunk_pattern = os.path.join(out_dir, f"chunk_%03d{ext}")
+
+    subprocess.run(
+        [
+            ffmpeg, "-i", audio_path,
+            "-f", "segment",
+            "-segment_time", str(chunk_minutes * 60),
+            "-c", "copy",
+            "-reset_timestamps", "1",
+            chunk_pattern,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    chunks = sorted(glob.glob(os.path.join(out_dir, f"chunk_*{ext}")))
+    if not chunks:
+        raise RuntimeError("ffmpeg produced no audio chunks.")
+    logger.info(f"Split audio into {len(chunks)} chunks of ≤{chunk_minutes} min")
+    return chunks
+
+
+# ── Groq Whisper transcription (free, cloud-safe) ────────────────────────────
+
+def _groq_call(audio_path: str, language: str | None) -> list:
+    """Send a single audio file to Groq Whisper. File must be < 25 MB."""
+    from groq import Groq
+
+    file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    if file_size_mb > _GROQ_MAX_MB:
+        raise RuntimeError(
+            f"Audio chunk is {file_size_mb:.1f} MB which still exceeds Groq's "
+            f"{_GROQ_MAX_MB} MB limit after re-encoding. "
+            "This video may have an unusually high audio bitrate. "
+            "Try reducing _SPLIT_MINUTES in transcript.py (e.g. to 10)."
         )
 
-        # Wrap segments as snippet-like objects
-        snippets = [
+    client = Groq()
+    logger.info(f"Groq Whisper: {os.path.basename(audio_path)} ({file_size_mb:.1f} MB)")
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    kwargs: dict = {
+        "file": (os.path.basename(audio_path), audio_bytes),
+        "model": "whisper-large-v3-turbo",
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["segment"],
+    }
+    if language:
+        kwargs["language"] = language
+
+    transcription = client.audio.transcriptions.create(**kwargs)
+    raw_segments = getattr(transcription, "segments", None) or []
+
+    # Groq SDK may return segments as dicts or as attribute-bearing objects
+    # depending on the SDK version. Normalise to SimpleNamespace so callers
+    # can always use seg.text / seg.start / seg.end uniformly.
+    segments = []
+    for seg in raw_segments:
+        if isinstance(seg, dict):
+            segments.append(SimpleNamespace(**seg))
+        else:
+            segments.append(seg)
+
+    return segments
+
+
+def _groq_transcribe(audio_path: str, language: str | None) -> list:
+    """
+    Transcribe audio using Groq's free Whisper API.
+
+    If the file exceeds Groq's 25 MB limit the audio is split into
+    20-minute chunks with ffmpeg, each chunk is transcribed separately,
+    and timestamps are stitched back into a continuous sequence.
+
+    This makes any video length work — no manual splitting required.
+    """
+    try:
+        from groq import Groq  # noqa: F401
+    except ImportError:
+        raise RuntimeError("groq package is not installed. Run: pip install groq")
+
+    file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+
+    # ── Small file: send directly ─────────────────────────────────────────────
+    if file_size_mb <= _GROQ_MAX_MB:
+        segments = _groq_call(audio_path, language)
+        return [
             SimpleNamespace(
-                text=seg["text"].strip(),
-                start=seg["start"],
-                duration=seg["end"] - seg["start"],
+                text=seg.text.strip(),
+                start=seg.start,
+                duration=seg.end - seg.start,
             )
             for seg in segments
-            if seg["text"].strip()
+            if seg.text.strip()
         ]
-        return snippets
+
+    # ── Large file: re-encode to 32 kbps → split → transcribe → stitch ─────────
+    logger.info(
+        f"Audio is {file_size_mb:.1f} MB > {_GROQ_MAX_MB} MB — "
+        f"re-encoding to 32 kbps then splitting into {_SPLIT_MINUTES}-min chunks"
+    )
+
+    _get_ffmpeg_exe()  # raises early with a clear message if ffmpeg is missing
+
+    split_dir = tempfile.mkdtemp()
+    try:
+        # Re-encode first so every chunk is guaranteed to be tiny (~5 MB per 20 min)
+        reencoded_path = _reencode_audio(audio_path, split_dir)
+        chunk_paths = _split_audio(reencoded_path, split_dir)
+
+        all_snippets: list = []
+        time_offset: float = 0.0
+
+        for i, chunk_path in enumerate(chunk_paths):
+            logger.info(f"Transcribing chunk {i + 1}/{len(chunk_paths)}: {chunk_path}")
+            segments = _groq_call(chunk_path, language)
+
+            chunk_end = 0.0
+            for seg in segments:
+                if not seg.text.strip():
+                    continue
+                all_snippets.append(
+                    SimpleNamespace(
+                        text=seg.text.strip(),
+                        start=seg.start + time_offset,
+                        duration=seg.end - seg.start,
+                    )
+                )
+                chunk_end = max(chunk_end, seg.end)
+
+            # Advance offset by the actual spoken duration of this chunk
+            time_offset += chunk_end if chunk_end > 0 else _SPLIT_MINUTES * 60
+
+        return all_snippets
 
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        if cookies_file and os.path.exists(cookies_file):
-            os.unlink(cookies_file)
+        shutil.rmtree(split_dir, ignore_errors=True)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -396,38 +460,45 @@ def _whisper_transcribe(video_id: str, language: str | None, model_size: str) ->
 def get_transcript_chunks(
     url: str,
     language: str | None = None,
-    whisper_model_size: str = WHISPER_MODEL_SIZE,
 ) -> tuple[list[dict], str, str]:
     """
     Fetch transcript and split into timestamp-aware chunks.
 
+    Strategy:
+      1. YouTube Transcript API (captions) — instant, no quota used
+      2. yt-dlp audio download → Groq Whisper API (free) — for caption-free videos
+         Large audio is auto-split into 20-min chunks before sending to Groq.
+
     Args:
-        url               – YouTube video URL
-        language          – ISO-639-1 code (e.g. "hi", "en") or None for auto
-        whisper_model_size – Whisper model size used if YouTube captions are absent
+        url      – YouTube video URL
+        language – ISO-639-1 code (e.g. "hi", "en") or None for auto-detect
 
     Returns:
-        chunks       – list of {"text", "start", "end"}
-        video_id     – YouTube video ID
-        source       – "youtube" | "whisper"
+        chunks   – list of {"text", "start", "end"}
+        video_id – YouTube video ID
+        source   – "youtube" | "groq_whisper"
     """
     video_id = extract_video_id(url)
     preferred_langs = ([language] if language else []) + ["hi", "en"]
 
-    # ── Try YouTube captions first ────────────────────────────────────────────
+    # ── 1. Try YouTube captions ───────────────────────────────────────────────
     snippets = _fetch_youtube_snippets(video_id, preferred_langs)
-
     if snippets:
         chunks = _snippets_to_chunks(snippets, video_id)
         return chunks, video_id, "youtube"
 
-    # ── Fall back to Whisper ──────────────────────────────────────────────────
-    logger.info(
-        f"No YouTube captions for {video_id}; falling back to Whisper ({whisper_model_size})"
-    )
-    snippets = _whisper_transcribe(video_id, language, whisper_model_size)
+    # ── 2. Fall back to Groq Whisper ──────────────────────────────────────────
+    logger.info(f"No YouTube captions for {video_id}; falling back to Groq Whisper")
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        audio_path = _download_audio(video_id, tmpdir)
+        snippets = _groq_transcribe(audio_path, language)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
     chunks = _snippets_to_chunks(snippets, video_id)
-    return chunks, video_id, "whisper"
+    return chunks, video_id, "groq_whisper"
 
 
 def get_transcript(url: str) -> tuple[str, str]:

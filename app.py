@@ -11,7 +11,6 @@ from config import (
     LANGUAGE_OPTIONS,
     LOG_FORMAT,
     LOG_LEVEL,
-    WHISPER_MODEL_SIZE,
 )
 from rag_chain import (
     format_docs_with_timestamps,
@@ -26,7 +25,16 @@ from vectorstore import clear_cache, get_cache_info, get_or_build_vectorstore
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+load_dotenv(override=True)
+
+# On Streamlit Cloud, secrets live in st.secrets (not os.environ).
+# Copy them into os.environ so every library (Groq, yt-dlp, etc.) finds them.
+for _key in ["GROQ_API_KEY", "YOUTUBE_COOKIES"]:
+    if _key not in os.environ:
+        try:
+            os.environ[_key] = st.secrets[_key]
+        except (KeyError, FileNotFoundError):
+            pass  # key not configured — will surface as a clear error when used
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -106,20 +114,9 @@ with st.sidebar:
         "Video Language",
         options=list(LANGUAGE_OPTIONS.keys()),
         index=0,
-        help="Select the spoken language of the video. Used to pick the right YouTube caption track and guide Whisper.",
+        help="Select the spoken language of the video. Used to pick the right YouTube caption track and guide Groq Whisper.",
     )
     selected_lang_code: str | None = LANGUAGE_OPTIONS[selected_lang_label]
-
-    # Whisper model size selector
-    whisper_size = st.selectbox(
-        "Whisper Model (fallback)",
-        options=["tiny", "base", "small", "medium", "large"],
-        index=["tiny", "base", "small", "medium", "large"].index(WHISPER_MODEL_SIZE),
-        help=(
-            "Used only when no YouTube captions are found.\n"
-            "tiny/base = fast | small = good for Hindi | medium/large = best quality (needs more RAM)"
-        ),
-    )
 
     st.divider()
 
@@ -128,7 +125,8 @@ with st.sidebar:
     st.markdown("- Embeddings: `paraphrase-multilingual-MiniLM-L12-v2` (local)")
     st.markdown("- Reranker: `mmarco-mMiniLMv2-L12` (local, multilingual)")
     st.markdown("- Vector DB: FAISS + BM25 (local)")
-    st.markdown(f"- LLM: `{selected_model}` (Groq)")
+    st.markdown(f"- LLM: `{selected_model}` (Groq free)")
+    st.markdown("- Transcription fallback: `whisper-large-v3-turbo` (Groq free)")
 
     st.divider()
 
@@ -204,7 +202,6 @@ if load_btn and url:
                 chunks, video_id, transcript_source = get_transcript_chunks(
                     url,
                     language=selected_lang_code,
-                    whisper_model_size=whisper_size,
                 )
 
                 # Reset chat only for brand-new videos
@@ -237,7 +234,7 @@ if load_btn and url:
                 source_badge = (
                     "📺 YouTube captions"
                     if transcript_source == "youtube"
-                    else f"🎙️ Whisper ({whisper_size})"
+                    else "🎙️ Groq Whisper"
                 )
                 st.success(
                     f"✅ Video loaded! "
@@ -245,33 +242,19 @@ if load_btn and url:
                 )
             except Exception as e:
                 err_msg = str(e)
-                if any(k in err_msg for k in ("403", "Forbidden", "Sign in", "bot", "cookies")):
-                    st.error("YouTube blocked the audio download (HTTP 403).")
-                    st.markdown(
-                        """
-**This video has no YouTube captions**, so the app tried to download its audio
-for local Whisper transcription — but YouTube blocked the request from this server's IP.
-
-**Fix: add your YouTube cookies as a secret.**
-
-1. Install **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**
-   in Chrome/Edge (or the Firefox equivalent).
-2. Go to **youtube.com** while logged in to your Google account.
-3. Click the extension → **Export cookies for this tab** → copy all the file contents.
-4. In **Streamlit Cloud → Settings → Secrets**, add:
-
-```toml
-YOUTUBE_COOKIES = \"\"\"
-# Netscape HTTP Cookie File
-.youtube.com   TRUE   /   FALSE   ...paste your cookies here...
-\"\"\"
-```
-
-For **local** use, add the same `YOUTUBE_COOKIES` variable to your `.env` file.
-
-> Cookies expire every few weeks — re-export if the error returns.
-                        """
+                if "blocked" in err_msg or "cookies" in err_msg.lower():
+                    st.error("YouTube blocked the audio download from this server.")
+                    st.info(
+                        "This video has no YouTube captions. The app tried to download "
+                        "its audio for Groq Whisper transcription, but YouTube blocked "
+                        "the request from Streamlit Cloud's IP.\n\n"
+                        "**Fix:** Export your YouTube cookies and add them as "
+                        "`YOUTUBE_COOKIES` in Streamlit Cloud → Settings → Secrets "
+                        "(Netscape format). See the README for step-by-step instructions."
                     )
+                elif "25 MB" in err_msg:
+                    st.error(err_msg)
+                    st.info("Try a shorter video (under ~30 minutes).")
                 else:
                     st.error(f"Error: {e}")
                 logger.exception("Failed to load video")
@@ -286,7 +269,7 @@ if av:
     src_label = (
         "📺 YouTube captions"
         if src == "youtube"
-        else f"🎙️ Whisper transcription"
+        else "🎙️ Groq Whisper"
     )
     with st.expander(f"📋 Video Summary  ·  {src_label}  ·  {lang}", expanded=True):
         st.markdown(av["summary"])
