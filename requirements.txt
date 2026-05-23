@@ -1,0 +1,18 @@
+youtube-transcript-api
+langchain==0.3.25
+langchain-core
+langchain-community==0.3.24
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+sentence-transformers          # multilingual embeddings + CrossEncoder reranker
+faiss-cpu==1.9.0
+streamlit==1.45.1
+python-dotenv==1.1.0
+rank-bm25                      # BM25 keyword search
+tiktoken
+
+# ── Whisper fallback (needed only for videos without YouTube captions) ────────
+openai-whisper
+yt-dlp
+imageio-ffmpeg    # auto-downloads ffmpeg binaries — no manual install needed
