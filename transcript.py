@@ -168,11 +168,10 @@ def _download_audio(video_id: str, out_dir: str) -> str:
     url = f"https://www.youtube.com/watch?v={video_id}"
     out_template = os.path.join(out_dir, f"{video_id}.%(ext)s")
 
-    # Prefer the smallest audio format available.
-    # worstaudio picks the lowest-bitrate audio-only stream — usually webm/opus
-    # at ~48-64 kbps, which is plenty for speech transcription.
-    # Explicit ext preferences ensure we get a container Groq can decode
-    # without ffmpeg post-processing.
+    # Prefer the smallest audio format to stay within Groq's 25 MB limit.
+    # We intentionally allow HLS streams — on Streamlit Cloud they are often
+    # the only formats YouTube exposes to datacenter IPs, and ffmpeg
+    # (available via packages.txt on cloud, imageio-ffmpeg locally) handles them.
     format_string = (
         "worstaudio[ext=webm]"
         "/worstaudio[ext=m4a]"
@@ -184,20 +183,30 @@ def _download_audio(video_id: str, out_dir: str) -> str:
         "/best"
     )
 
+    # Tell yt-dlp where ffmpeg lives so it can handle HLS and any format
+    # that needs post-processing (works locally via imageio-ffmpeg too).
+    try:
+        ffmpeg_exe = _get_ffmpeg_exe()
+        ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+    except RuntimeError:
+        ffmpeg_dir = None
+
     base_opts: dict = {
         "format": format_string,
         "outtmpl": out_template,
         "quiet": True,
         "no_warnings": True,
     }
+    if ffmpeg_dir:
+        base_opts["ffmpeg_location"] = ffmpeg_dir
 
     cookies_file = _get_cookies_file()
     if cookies_file:
         base_opts["cookiefile"] = cookies_file
 
-    # mweb (mobile web) often bypasses datacenter-IP blocks that affect the
-    # desktop web client. Try it first, then fall back in order.
-    player_clients = ["mweb", "ios", "android", "web"]
+    # mweb (mobile web) often bypasses datacenter-IP restrictions.
+    # tv_embedded uses a different API endpoint and works when others fail.
+    player_clients = ["mweb", "tv_embedded", "ios", "android", "web"]
 
     last_error: Exception | None = None
 
@@ -206,10 +215,7 @@ def _download_audio(video_id: str, out_dir: str) -> str:
             opts = {
                 **base_opts,
                 "extractor_args": {
-                    "youtube": {
-                        "player_client": [client],
-                        "skip": ["hls"],  # HLS streams require ffmpeg to merge; skip
-                    }
+                    "youtube": {"player_client": [client]},
                 },
             }
             logger.info(f"yt-dlp download attempt: player_client={client}")
