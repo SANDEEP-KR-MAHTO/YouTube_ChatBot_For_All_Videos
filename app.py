@@ -244,7 +244,36 @@ if load_btn and url:
                     f"{word_count:,} words · {len(docs)} chunks · {source_badge}"
                 )
             except Exception as e:
-                st.error(f"Error: {e}")
+                err_msg = str(e)
+                if "403" in err_msg or "Forbidden" in err_msg:
+                    st.error("YouTube blocked the audio download (HTTP 403).")
+                    st.markdown(
+                        """
+**This video has no YouTube captions**, so the app tried to download its audio
+for local Whisper transcription — but YouTube blocked the request from this server's IP.
+
+**Fix: add your YouTube cookies as a secret.**
+
+1. Install **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**
+   in Chrome/Edge (or the Firefox equivalent).
+2. Go to **youtube.com** while logged in to your Google account.
+3. Click the extension → **Export cookies for this tab** → copy all the file contents.
+4. In **Streamlit Cloud → Settings → Secrets**, add:
+
+```toml
+YOUTUBE_COOKIES = \"\"\"
+# Netscape HTTP Cookie File
+.youtube.com   TRUE   /   FALSE   ...paste your cookies here...
+\"\"\"
+```
+
+For **local** use, add the same `YOUTUBE_COOKIES` variable to your `.env` file.
+
+> Cookies expire every few weeks — re-export if the error returns.
+                        """
+                    )
+                else:
+                    st.error(f"Error: {e}")
                 logger.exception("Failed to load video")
 
 # ── Main chat area ────────────────────────────────────────────────────────────
