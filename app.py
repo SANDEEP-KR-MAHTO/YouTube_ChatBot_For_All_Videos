@@ -245,7 +245,7 @@ if load_btn and url:
                 )
             except Exception as e:
                 err_msg = str(e)
-                if "403" in err_msg or "Forbidden" in err_msg:
+                if any(k in err_msg for k in ("403", "Forbidden", "Sign in", "bot", "cookies")):
                     st.error("YouTube blocked the audio download (HTTP 403).")
                     st.markdown(
                         """

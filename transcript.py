@@ -337,7 +337,7 @@ def _whisper_transcribe(video_id: str, language: str | None, model_size: str) ->
 
         if not downloaded:
             err = str(last_error)
-            if "403" in err or "Forbidden" in err:
+            if any(k in err for k in ("403", "Forbidden", "Sign in", "bot", "cookies")):
                 raise RuntimeError(
                     "YouTube blocked the audio download (HTTP 403 Forbidden) "
                     "on all player clients (ios, android, web).\n\n"
