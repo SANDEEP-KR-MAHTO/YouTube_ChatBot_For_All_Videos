@@ -42,25 +42,32 @@ def _snippets_to_chunks(snippets: list, video_id: str) -> list[dict]:
     if not snippets:
         raise NoCaptionsError("Transcript is empty.")
 
+    # Support both dict-style and object-style snippets across API versions
+    def _get(snippet, key, default=0):
+        if isinstance(snippet, dict):
+            return snippet.get(key, default)
+        return getattr(snippet, key, default)
+
     chunks: list[dict] = []
     current_texts: list[str] = []
-    current_start: float = snippets[0]["start"]
+    current_start: float = _get(snippets[0], "start")
     current_len: int = 0
 
     for snippet in snippets:
-        text = snippet["text"].strip().replace("\n", " ")
+        text = str(_get(snippet, "text", "")).strip().replace("\n", " ")
         if not text:
             continue
 
+        snippet_start = _get(snippet, "start")
         if current_len + len(text) > CHUNK_SIZE and current_texts:
             chunks.append({
                 "text": " ".join(current_texts),
                 "start": current_start,
-                "end": snippet["start"],
+                "end": snippet_start,
             })
             overlap = " ".join(current_texts)[-CHUNK_OVERLAP:]
             current_texts = [overlap, text] if overlap else [text]
-            current_start = snippet["start"]
+            current_start = snippet_start
             current_len = sum(len(t) for t in current_texts)
         else:
             current_texts.append(text)
@@ -71,7 +78,7 @@ def _snippets_to_chunks(snippets: list, video_id: str) -> list[dict]:
         chunks.append({
             "text": " ".join(current_texts),
             "start": current_start,
-            "end": last["start"] + last.get("duration", 0),
+            "end": _get(last, "start") + _get(last, "duration"),
         })
 
     logger.info(f"Built {len(chunks)} chunks for video {video_id}")
