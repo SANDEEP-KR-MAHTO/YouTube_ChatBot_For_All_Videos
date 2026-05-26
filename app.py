@@ -130,6 +130,19 @@ with st.sidebar:
 
     st.divider()
 
+    # Cookie status — warn early for caption-free videos
+    if os.getenv("YOUTUBE_COOKIES"):
+        st.success("YouTube cookies: configured", icon="🍪")
+    else:
+        st.warning(
+            "YouTube cookies: not set\n\n"
+            "Videos **with** YouTube captions work fine.\n"
+            "Videos **without** captions need cookies to download audio on Streamlit Cloud.",
+            icon="⚠️",
+        )
+
+    st.divider()
+
     # Loaded videos — multi-video switcher
     st.markdown("**Loaded Videos**")
     if st.session_state.videos:
@@ -243,15 +256,42 @@ if load_btn and url:
             except Exception as e:
                 err_msg = str(e)
                 if "blocked" in err_msg or "cookies" in err_msg.lower():
-                    st.error("YouTube blocked the audio download from this server.")
-                    st.info(
-                        "This video has no YouTube captions. The app tried to download "
-                        "its audio for Groq Whisper transcription, but YouTube blocked "
-                        "the request from Streamlit Cloud's IP.\n\n"
-                        "**Fix:** Export your YouTube cookies and add them as "
-                        "`YOUTUBE_COOKIES` in Streamlit Cloud → Settings → Secrets "
-                        "(Netscape format). See the README for step-by-step instructions."
+                    st.error(
+                        "YouTube blocked the audio download from Streamlit Cloud's IP. "
+                        "This video has no YouTube captions, so the app needs to download "
+                        "its audio — but YouTube blocks cloud servers from doing that."
                     )
+                    with st.expander("Fix: add YouTube cookies (takes ~2 minutes)", expanded=True):
+                        st.markdown(
+                            """
+**Why cookies help:** When you provide your browser cookies, yt-dlp authenticates
+as your Google account, and YouTube allows the download.
+
+**Step-by-step:**
+
+1. Install the **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**
+   Chrome/Edge extension *(or the equivalent Firefox add-on)*.
+
+2. Go to **[youtube.com](https://youtube.com)** while **logged in** to your Google account.
+
+3. Click the extension icon → **Export cookies for this tab**.
+   You'll get a text file in Netscape cookie format.
+
+4. Open the file, copy **all** its contents.
+
+5. In **Streamlit Cloud → your app → Settings → Secrets**, add:
+```toml
+YOUTUBE_COOKIES = \"\"\"
+# Netscape HTTP Cookie File
+.youtube.com   TRUE   /   FALSE   ...paste the full cookie file here...
+\"\"\"
+```
+
+6. Click **Save** and **Reboot app**.
+
+> Cookies expire every few weeks — re-export if the error returns.
+                            """
+                        )
                 elif "25 MB" in err_msg:
                     st.error(err_msg)
                     st.info("Try a shorter video (under ~30 minutes).")
