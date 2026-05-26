@@ -167,7 +167,7 @@ def _fetch_snippets(video_id: str) -> list:
                 logger.warning(msg)
                 errors.append(msg)
 
-    # 3. Any transcript in any language
+    # 3. Any transcript in any language (direct fetch)
     for t in all_transcripts:
         try:
             snippets = list(t.fetch())
@@ -179,17 +179,44 @@ def _fetch_snippets(video_id: str) -> list:
             logger.warning(msg)
             errors.append(msg)
 
-    # 4. get_transcript() class-method — plain dicts, works across API versions
-    try:
-        kw = {"cookies": cookies} if cookies else {}
-        snippets = YouTubeTranscriptApi.get_transcript(video_id, **kw)
-        if snippets:
-            logger.info("Strategy 4 success: get_transcript()")
-            return list(snippets)
-    except Exception as e:
-        msg = f"get_transcript() → {type(e).__name__}: {e}"
-        logger.warning(msg)
-        errors.append(msg)
+    # 4. get_transcript() using every language code we know about
+    #    (strategy 3 may fail with ParseError on auto-generated tracks; this
+    #    code path uses a different internal fetch mechanism and often succeeds)
+    langs_to_try = ["en"] + [t.language_code for t in all_transcripts]
+    seen: set[str] = set()
+    for lang in langs_to_try:
+        if lang in seen:
+            continue
+        seen.add(lang)
+        try:
+            kw = {"cookies": cookies} if cookies else {}
+            snippets = YouTubeTranscriptApi.get_transcript(
+                video_id, languages=[lang], **kw
+            )
+            if snippets:
+                logger.info(f"Strategy 4 success: get_transcript(languages=[{lang!r}])")
+                return list(snippets)
+        except Exception as e:
+            msg = f"get_transcript({lang!r}) → {type(e).__name__}: {e}"
+            logger.warning(msg)
+            errors.append(msg)
+
+    # 5. Translate any translatable transcript to English
+    #    Useful when the video only has non-English auto-generated captions
+    for t in all_transcripts:
+        if not getattr(t, "is_translatable", False):
+            continue
+        try:
+            snippets = list(t.translate("en").fetch())
+            if snippets:
+                logger.info(
+                    f"Strategy 5 success: translated {t.language_code} → en"
+                )
+                return snippets
+        except Exception as e:
+            msg = f"{t.language_code}→en translate → {type(e).__name__}: {e}"
+            logger.warning(msg)
+            errors.append(msg)
 
     detail = " | ".join(errors) if errors else "no transcripts listed by YouTube"
     raise NoCaptionsError(
