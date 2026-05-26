@@ -12,7 +12,7 @@ from rag_chain import (
     retrieve_and_rerank,
     stream_response,
 )
-from transcript import NoCaptionsError, format_timestamp, get_transcript_chunks
+from transcript import NoCaptionsError, format_timestamp, get_transcript_chunks, init_cookies
 from vectorstore import clear_cache, get_cache_info, get_or_build_vectorstore
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -28,6 +28,18 @@ for _key in ["GROQ_API_KEY"]:
             os.environ[_key] = st.secrets[_key]
         except (KeyError, FileNotFoundError):
             pass
+
+# ── YouTube cookies (bypasses 429 rate-limiting on cloud IPs) ─────────────────
+# Store the raw content of a cookies.txt (Netscape format) in your Streamlit
+# secret as YOUTUBE_COOKIES.  When present it is written to a temp file and
+# passed to every youtube-transcript-api call so YouTube sees a real browser.
+_yt_cookie_content: str | None = None
+try:
+    _yt_cookie_content = st.secrets["YOUTUBE_COOKIES"]
+except (KeyError, FileNotFoundError):
+    _yt_cookie_content = os.getenv("YOUTUBE_COOKIES")
+if _yt_cookie_content:
+    init_cookies(_yt_cookie_content)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -102,6 +114,10 @@ with st.sidebar:
     st.markdown("- Reranker: `mmarco-mMiniLMv2-L12`")
     st.markdown("- Vector DB: FAISS + BM25")
     st.markdown(f"- LLM: `{selected_model}` (Groq free)")
+    if _yt_cookie_content:
+        st.markdown("- YouTube: 🍪 cookies active")
+    else:
+        st.markdown("- YouTube: ⚠️ no cookies (may hit rate limits)")
 
     st.divider()
 

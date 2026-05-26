@@ -1,11 +1,35 @@
 import logging
+import os
 import re
+import tempfile
 
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from config import CHUNK_OVERLAP, CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
+
+# Path to a Netscape-format cookies.txt file written at startup by app.py.
+# When set, all YouTube API calls include the cookie header so YouTube
+# treats the request as coming from a logged-in browser instead of a bot.
+_cookie_path: str | None = None
+
+
+def init_cookies(cookie_content: str) -> None:
+    """
+    Write the raw cookies.txt content to a temp file and remember its path.
+    Call this once at app startup if YOUTUBE_COOKIES is available in secrets.
+    """
+    global _cookie_path
+    if not cookie_content or not cookie_content.strip():
+        return
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    )
+    tmp.write(cookie_content)
+    tmp.close()
+    _cookie_path = tmp.name
+    logger.info(f"YouTube cookies initialised ({len(cookie_content):,} bytes)")
 
 
 class NoCaptionsError(RuntimeError):
@@ -90,23 +114,27 @@ def _snippets_to_chunks(snippets: list, video_id: str) -> list[dict]:
 def _fetch_snippets(video_id: str) -> list:
     """
     Try every available strategy to get captions from YouTube.
-      1. Manual English transcript
+      1. Manual English transcript  (with cookies if available)
       2. Auto-generated English transcript
       3. Any available transcript in any language
-      4. get_transcript() class-method fallback (returns dicts, older API style)
+      4. get_transcript() class-method fallback
     Each strategy is isolated so one failure never silences the next.
     Raises NoCaptionsError if nothing is found.
     """
     errors: list[str] = []
     all_transcripts = []
+    cookies = _cookie_path  # may be None — API ignores it when None
 
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        kw = {"cookies": cookies} if cookies else {}
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, **kw)
         all_transcripts = list(transcript_list)
         logger.info(
             f"list_transcripts: {len(all_transcripts)} transcripts for {video_id} — "
-            + ", ".join(f"{t.language_code}({'auto' if t.is_generated else 'manual'})"
-                        for t in all_transcripts)
+            + ", ".join(
+                f"{t.language_code}({'auto' if t.is_generated else 'manual'})"
+                for t in all_transcripts
+            )
         )
     except Exception as e:
         msg = f"list_transcripts → {type(e).__name__}: {e}"
@@ -153,7 +181,8 @@ def _fetch_snippets(video_id: str) -> list:
 
     # 4. get_transcript() class-method — plain dicts, works across API versions
     try:
-        snippets = YouTubeTranscriptApi.get_transcript(video_id)
+        kw = {"cookies": cookies} if cookies else {}
+        snippets = YouTubeTranscriptApi.get_transcript(video_id, **kw)
         if snippets:
             logger.info("Strategy 4 success: get_transcript()")
             return list(snippets)
