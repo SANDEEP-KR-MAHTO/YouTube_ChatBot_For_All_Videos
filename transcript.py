@@ -168,23 +168,15 @@ def _download_audio(video_id: str, out_dir: str) -> str:
     url = f"https://www.youtube.com/watch?v={video_id}"
     out_template = os.path.join(out_dir, f"{video_id}.%(ext)s")
 
-    # Prefer the smallest audio format to stay within Groq's 25 MB limit.
-    # We intentionally allow HLS streams — on Streamlit Cloud they are often
-    # the only formats YouTube exposes to datacenter IPs, and ffmpeg
-    # (available via packages.txt on cloud, imageio-ffmpeg locally) handles them.
-    format_string = (
-        "worstaudio[ext=webm]"
-        "/worstaudio[ext=m4a]"
-        "/worstaudio"
-        "/bestaudio[ext=m4a]"
-        "/bestaudio[ext=webm]"
-        "/bestaudio"
-        "/best[height<=144]"
-        "/best"
-    )
+    # "bestaudio/best" is the most universally compatible format selector.
+    # Avoid worstaudio / ext filters — many player clients don't expose
+    # audio-only streams and the whole chain silently fails with
+    # "Requested format is not available".
+    # File size is handled after download via re-encoding to 32 kbps.
+    format_string = "bestaudio/best"
 
-    # Tell yt-dlp where ffmpeg lives so it can handle HLS and any format
-    # that needs post-processing (works locally via imageio-ffmpeg too).
+    # Tell yt-dlp where ffmpeg lives so it can handle HLS streams and any
+    # format that needs post-processing.
     try:
         ffmpeg_exe = _get_ffmpeg_exe()
         ffmpeg_dir = os.path.dirname(ffmpeg_exe)
@@ -204,21 +196,27 @@ def _download_audio(video_id: str, out_dir: str) -> str:
     if cookies_file:
         base_opts["cookiefile"] = cookies_file
 
-    # mweb (mobile web) often bypasses datacenter-IP restrictions.
-    # tv_embedded uses a different API endpoint and works when others fail.
-    player_clients = ["mweb", "tv_embedded", "ios", "android", "web"]
+    # Each attempt uses a different YouTube player client.
+    # The final entry (None) lets yt-dlp pick the client automatically —
+    # useful when explicit client names are all blocked or return no formats.
+    player_clients = ["mweb", "tv_embedded", "ios", "android", "web", None]
 
     last_error: Exception | None = None
 
     try:
         for client in player_clients:
-            opts = {
-                **base_opts,
-                "extractor_args": {
-                    "youtube": {"player_client": [client]},
-                },
-            }
-            logger.info(f"yt-dlp download attempt: player_client={client}")
+            if client is not None:
+                extractor_args = {"youtube": {"player_client": [client]}}
+                label = client
+            else:
+                extractor_args = {}   # let yt-dlp decide
+                label = "auto"
+
+            opts = {**base_opts}
+            if extractor_args:
+                opts["extractor_args"] = extractor_args
+
+            logger.info(f"yt-dlp download attempt: player_client={label}")
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
@@ -230,7 +228,7 @@ def _download_audio(video_id: str, out_dir: str) -> str:
 
             except Exception as exc:
                 last_error = exc
-                logger.warning(f"yt-dlp player_client={client} failed: {exc}")
+                logger.warning(f"yt-dlp player_client={label} failed: {exc}")
                 for f in glob.glob(os.path.join(out_dir, f"{video_id}.*")):
                     try:
                         os.remove(f)
@@ -254,8 +252,41 @@ def _download_audio(video_id: str, out_dir: str) -> str:
             "Streamlit secrets (see README for step-by-step instructions)."
         )
     if last_error:
-        raise RuntimeError(f"Audio download failed: {last_error}") from last_error
-    raise RuntimeError("Audio download failed: no file was produced.")
+        raise RuntimeError(f"yt-dlp failed: {last_error}") from last_error
+    raise RuntimeError("yt-dlp failed: no file was produced.")
+
+
+# ── pytubefix fallback downloader ────────────────────────────────────────────
+
+def _download_audio_pytubefix(video_id: str, out_dir: str) -> str:
+    """
+    Download audio using pytubefix (YouTube InnerTube API).
+
+    pytubefix uses a completely different network path from yt-dlp, so it
+    often succeeds on Streamlit Cloud when yt-dlp gets 'format not available'.
+    """
+    try:
+        from pytubefix import YouTube  # type: ignore
+    except ImportError:
+        raise RuntimeError("pytubefix is not installed. Run: pip install pytubefix")
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    logger.info(f"Trying pytubefix download for {video_id}")
+
+    yt = YouTube(url, use_oauth=False, allow_oauth_cache=False)
+
+    # Prefer audio-only streams (smaller); fall back to progressive (video+audio)
+    stream = (
+        yt.streams.filter(only_audio=True).order_by("abr").first()
+        or yt.streams.filter(progressive=True).order_by("resolution").first()
+    )
+
+    if stream is None:
+        raise RuntimeError("pytubefix found no downloadable stream for this video.")
+
+    out_path = stream.download(output_path=out_dir, filename=f"{video_id}.{stream.subtype}")
+    logger.info(f"pytubefix downloaded: {out_path}")
+    return out_path
 
 
 # ── ffmpeg resolution ─────────────────────────────────────────────────────────
@@ -498,7 +529,25 @@ def get_transcript_chunks(
 
     tmpdir = tempfile.mkdtemp()
     try:
-        audio_path = _download_audio(video_id, tmpdir)
+        # Try yt-dlp first; if it fails (common on cloud IPs), try pytubefix
+        # which uses a different network path and often succeeds where yt-dlp fails.
+        audio_path = None
+        ytdlp_error = None
+
+        try:
+            audio_path = _download_audio(video_id, tmpdir)
+        except RuntimeError as e:
+            ytdlp_error = e
+            logger.warning(f"yt-dlp failed, trying pytubefix: {e}")
+
+        if audio_path is None:
+            try:
+                audio_path = _download_audio_pytubefix(video_id, tmpdir)
+            except Exception as e2:
+                logger.warning(f"pytubefix also failed: {e2}")
+                # Both engines failed — raise original yt-dlp error (more descriptive)
+                raise ytdlp_error or RuntimeError(str(e2))
+
         snippets = _groq_transcribe(audio_path, language)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

@@ -15,6 +15,7 @@ groq                           # Groq SDK: LLM + Whisper audio transcription API
 
 # ── Audio download (Whisper fallback for caption-free videos) ────────────────
 yt-dlp                         # downloads YouTube audio for Groq Whisper fallback
+pytubefix                      # fallback downloader using YouTube InnerTube API
 imageio-ffmpeg                 # bundles ffmpeg binaries — no manual install needed locally
 
 # ── App / utilities ───────────────────────────────────────────────────────────
