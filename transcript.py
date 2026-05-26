@@ -11,6 +11,11 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 from config import CHUNK_OVERLAP, CHUNK_SIZE
 
+
+class NoCaptionsError(RuntimeError):
+    """Raised when a video has no captions and audio download is unavailable."""
+    pass
+
 logger = logging.getLogger(__name__)
 
 # Groq's hard upload limit
@@ -105,19 +110,28 @@ def _snippets_to_chunks(snippets: list, video_id: str) -> list[dict]:
 
 def _fetch_youtube_snippets(video_id: str, preferred_langs: list[str]) -> list | None:
     """
-    Try to fetch YouTube captions with language preference.
-    Returns snippet objects or None if unavailable.
+    Try every possible way to get YouTube captions, in order:
+      1. Manual transcript in preferred languages
+      2. Auto-generated transcript in preferred languages
+      3. Any available transcript (any language)
+      4. YouTube's built-in translation of any transcript → first preferred lang
+      5. Plain api.fetch() as a last-resort fallback
+    Returns a list of snippet objects, or None if truly unavailable.
     """
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        all_transcripts = list(transcript_list)
 
         transcript = None
+
+        # 1. Manual transcript in preferred languages
         try:
             transcript = transcript_list.find_manually_created_transcript(preferred_langs)
             logger.info(f"Found manual transcript: lang={transcript.language_code}")
         except Exception:
             pass
 
+        # 2. Auto-generated transcript in preferred languages
         if transcript is None:
             try:
                 transcript = transcript_list.find_generated_transcript(preferred_langs)
@@ -125,24 +139,43 @@ def _fetch_youtube_snippets(video_id: str, preferred_langs: list[str]) -> list |
             except Exception:
                 pass
 
-        if transcript is None:
-            try:
-                transcript = next(iter(transcript_list))
-                logger.info(f"Using first available transcript: lang={transcript.language_code}")
-            except StopIteration:
-                pass
+        # 3. Any transcript in any language
+        if transcript is None and all_transcripts:
+            transcript = all_transcripts[0]
+            logger.info(f"Using first available transcript: lang={transcript.language_code}")
 
         if transcript is not None:
-            return list(transcript.fetch())
+            snippets = list(transcript.fetch())
+            if snippets:
+                return snippets
+
+        # 4. Translation fallback — if a transcript exists in any language,
+        #    translate it to the first preferred language using YouTube's API.
+        #    This covers e.g. English-only videos when Hindi is requested.
+        if all_transcripts and preferred_langs:
+            for t in all_transcripts:
+                for lang in preferred_langs:
+                    try:
+                        translated = t.translate(lang)
+                        snippets = list(translated.fetch())
+                        if snippets:
+                            logger.info(
+                                f"Used YouTube translation: {t.language_code} → {lang}"
+                            )
+                            return snippets
+                    except Exception:
+                        continue
 
     except Exception as e:
         logger.debug(f"list_transcripts failed: {e}")
 
+    # 5. Plain fetch — bypasses list_transcripts entirely
     try:
         api = YouTubeTranscriptApi()
         snippets = list(api.fetch(video_id))
-        logger.info("Fetched transcript via plain api.fetch()")
-        return snippets
+        if snippets:
+            logger.info("Fetched transcript via plain api.fetch()")
+            return snippets
     except Exception as e:
         logger.debug(f"Plain fetch failed: {e}")
 
@@ -524,13 +557,22 @@ def get_transcript_chunks(
         chunks = _snippets_to_chunks(snippets, video_id)
         return chunks, video_id, "youtube"
 
-    # ── 2. Fall back to Groq Whisper ──────────────────────────────────────────
+    # ── 2. Fall back to Groq Whisper via audio download ───────────────────────
+    # Audio download from YouTube is blocked on cloud servers without cookies.
+    # Skip straight to a clear error if no cookies are configured — this avoids
+    # a long wait followed by the same result.
+    has_cookies = bool(os.environ.get("YOUTUBE_COOKIES", "").strip())
+
+    if not has_cookies:
+        raise NoCaptionsError(
+            "This video has no YouTube captions available.\n"
+            "Audio download from cloud servers requires YouTube cookies to be configured."
+        )
+
     logger.info(f"No YouTube captions for {video_id}; falling back to Groq Whisper")
 
     tmpdir = tempfile.mkdtemp()
     try:
-        # Try yt-dlp first; if it fails (common on cloud IPs), try pytubefix
-        # which uses a different network path and often succeeds where yt-dlp fails.
         audio_path = None
         ytdlp_error = None
 
@@ -545,8 +587,10 @@ def get_transcript_chunks(
                 audio_path = _download_audio_pytubefix(video_id, tmpdir)
             except Exception as e2:
                 logger.warning(f"pytubefix also failed: {e2}")
-                # Both engines failed — raise original yt-dlp error (more descriptive)
-                raise ytdlp_error or RuntimeError(str(e2))
+                raise NoCaptionsError(
+                    "This video has no YouTube captions and audio download failed.\n"
+                    f"Details: {ytdlp_error or e2}"
+                )
 
         snippets = _groq_transcribe(audio_path, language)
     finally:

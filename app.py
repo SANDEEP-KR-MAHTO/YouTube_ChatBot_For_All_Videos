@@ -18,7 +18,7 @@ from rag_chain import (
     retrieve_and_rerank,
     stream_response,
 )
-from transcript import format_timestamp, get_transcript_chunks
+from transcript import NoCaptionsError, format_timestamp, get_transcript_chunks
 from vectorstore import clear_cache, get_cache_info, get_or_build_vectorstore
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -253,46 +253,31 @@ if load_btn and url:
                     f"✅ Video loaded! "
                     f"{word_count:,} words · {len(docs)} chunks · {source_badge}"
                 )
+            except NoCaptionsError:
+                st.warning("⚠️ This video has no YouTube captions available.")
+                st.markdown(
+                    """
+Most popular YouTube videos have auto-generated captions and work perfectly.
+This particular video has none, so it can't be processed on the cloud deployment.
+
+**Try one of these instead — they all have captions:**
+| Channel / Video | Language |
+|---|---|
+| [3Blue1Brown](https://www.youtube.com/c/3blue1brown) | English |
+| [Kurzgesagt](https://www.youtube.com/@kurzgesagt) | English |
+| [Khan Academy](https://www.youtube.com/c/khanacademy) | English |
+| [Study IQ](https://www.youtube.com/@studyiq) | Hindi |
+| [Physics Wallah](https://www.youtube.com/@PhysicsWallah) | Hindi |
+| [Unacademy](https://www.youtube.com/@unacademy) | Hindi |
+
+> **Running locally?** Caption-free videos work fine on your own machine.
+                    """
+                )
+                logger.warning("Video has no captions — NoCaptionsError raised")
+
             except Exception as e:
                 err_msg = str(e)
-                if "blocked" in err_msg or "cookies" in err_msg.lower():
-                    st.error(
-                        "YouTube blocked the audio download from Streamlit Cloud's IP. "
-                        "This video has no YouTube captions, so the app needs to download "
-                        "its audio — but YouTube blocks cloud servers from doing that."
-                    )
-                    with st.expander("Fix: add YouTube cookies (takes ~2 minutes)", expanded=True):
-                        st.markdown(
-                            """
-**Why cookies help:** When you provide your browser cookies, yt-dlp authenticates
-as your Google account, and YouTube allows the download.
-
-**Step-by-step:**
-
-1. Install the **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**
-   Chrome/Edge extension *(or the equivalent Firefox add-on)*.
-
-2. Go to **[youtube.com](https://youtube.com)** while **logged in** to your Google account.
-
-3. Click the extension icon → **Export cookies for this tab**.
-   You'll get a text file in Netscape cookie format.
-
-4. Open the file, copy **all** its contents.
-
-5. In **Streamlit Cloud → your app → Settings → Secrets**, add:
-```toml
-YOUTUBE_COOKIES = \"\"\"
-# Netscape HTTP Cookie File
-.youtube.com   TRUE   /   FALSE   ...paste the full cookie file here...
-\"\"\"
-```
-
-6. Click **Save** and **Reboot app**.
-
-> Cookies expire every few weeks — re-export if the error returns.
-                            """
-                        )
-                elif "25 MB" in err_msg:
+                if "25 MB" in err_msg:
                     st.error(err_msg)
                     st.info("Try a shorter video (under ~30 minutes).")
                 else:
