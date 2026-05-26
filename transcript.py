@@ -97,18 +97,21 @@ def _fetch_snippets(video_id: str) -> list:
     Each strategy is isolated so one failure never silences the next.
     Raises NoCaptionsError if nothing is found.
     """
+    errors: list[str] = []
     all_transcripts = []
+
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         all_transcripts = list(transcript_list)
         logger.info(
-            f"list_transcripts: {len(all_transcripts)} transcripts available "
-            f"for {video_id} — "
+            f"list_transcripts: {len(all_transcripts)} transcripts for {video_id} — "
             + ", ".join(f"{t.language_code}({'auto' if t.is_generated else 'manual'})"
                         for t in all_transcripts)
         )
     except Exception as e:
-        logger.warning(f"list_transcripts failed for {video_id}: {type(e).__name__}: {e}")
+        msg = f"list_transcripts → {type(e).__name__}: {e}"
+        logger.warning(msg)
+        errors.append(msg)
 
     # 1. Manual English
     for t in all_transcripts:
@@ -119,7 +122,9 @@ def _fetch_snippets(video_id: str) -> list:
                     logger.info("Strategy 1 success: manual English transcript")
                     return snippets
             except Exception as e:
-                logger.warning(f"Strategy 1 fetch failed ({t.language_code}): {type(e).__name__}: {e}")
+                msg = f"manual-en fetch → {type(e).__name__}: {e}"
+                logger.warning(msg)
+                errors.append(msg)
 
     # 2. Auto-generated English
     for t in all_transcripts:
@@ -130,7 +135,9 @@ def _fetch_snippets(video_id: str) -> list:
                     logger.info("Strategy 2 success: auto-generated English transcript")
                     return snippets
             except Exception as e:
-                logger.warning(f"Strategy 2 fetch failed ({t.language_code}): {type(e).__name__}: {e}")
+                msg = f"auto-en fetch → {type(e).__name__}: {e}"
+                logger.warning(msg)
+                errors.append(msg)
 
     # 3. Any transcript in any language
     for t in all_transcripts:
@@ -140,21 +147,24 @@ def _fetch_snippets(video_id: str) -> list:
                 logger.info(f"Strategy 3 success: lang={t.language_code}")
                 return snippets
         except Exception as e:
-            logger.warning(f"Strategy 3 fetch failed ({t.language_code}): {type(e).__name__}: {e}")
-            continue
+            msg = f"{t.language_code} fetch → {type(e).__name__}: {e}"
+            logger.warning(msg)
+            errors.append(msg)
 
-    # 4. get_transcript() class-method — works with older API versions, returns plain dicts
+    # 4. get_transcript() class-method — plain dicts, works across API versions
     try:
         snippets = YouTubeTranscriptApi.get_transcript(video_id)
         if snippets:
-            logger.info("Strategy 4 success: get_transcript() class method")
+            logger.info("Strategy 4 success: get_transcript()")
             return list(snippets)
     except Exception as e:
-        logger.warning(f"Strategy 4 (get_transcript) failed: {type(e).__name__}: {e}")
+        msg = f"get_transcript() → {type(e).__name__}: {e}"
+        logger.warning(msg)
+        errors.append(msg)
 
+    detail = " | ".join(errors) if errors else "no transcripts listed by YouTube"
     raise NoCaptionsError(
-        "This video has no YouTube captions available. "
-        "Please try a video that has captions enabled."
+        f"Could not retrieve captions for this video.\n\nDiagnostic: {detail}"
     )
 
 

@@ -203,7 +203,10 @@ if load_btn and url:
                 st.success(f"✅ Loaded! {word_count:,} words · {len(docs)} chunks")
 
             except NoCaptionsError as e:
-                st.warning(f"⚠️ {e}")
+                parts = str(e).split("\n\nDiagnostic: ", 1)
+                st.warning(f"⚠️ {parts[0]}")
+                if len(parts) > 1:
+                    st.error(f"🔍 **Debug info (share this):** {parts[1]}")
                 st.info(
                     "**This video has no YouTube captions.** "
                     "Try a video that has captions enabled. Most popular English "
