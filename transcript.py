@@ -93,51 +93,64 @@ def _fetch_snippets(video_id: str) -> list:
       1. Manual English transcript
       2. Auto-generated English transcript
       3. Any available transcript in any language
-      4. Plain api.fetch() as last resort
+      4. get_transcript() class-method fallback (returns dicts, older API style)
+    Each strategy is isolated so one failure never silences the next.
     Raises NoCaptionsError if nothing is found.
     """
+    all_transcripts = []
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         all_transcripts = list(transcript_list)
+        logger.info(
+            f"list_transcripts: {len(all_transcripts)} transcripts available "
+            f"for {video_id} — "
+            + ", ".join(f"{t.language_code}({'auto' if t.is_generated else 'manual'})"
+                        for t in all_transcripts)
+        )
+    except Exception as e:
+        logger.warning(f"list_transcripts failed for {video_id}: {type(e).__name__}: {e}")
 
-        # 1. Manual English
-        for t in all_transcripts:
-            if not t.is_generated and t.language_code.startswith("en"):
-                snippets = list(t.fetch())
-                if snippets:
-                    logger.info("Manual English transcript found")
-                    return snippets
-
-        # 2. Auto-generated English
-        for t in all_transcripts:
-            if t.is_generated and t.language_code.startswith("en"):
-                snippets = list(t.fetch())
-                if snippets:
-                    logger.info("Auto-generated English transcript found")
-                    return snippets
-
-        # 3. Any transcript in any language
-        for t in all_transcripts:
+    # 1. Manual English
+    for t in all_transcripts:
+        if not t.is_generated and t.language_code.startswith("en"):
             try:
                 snippets = list(t.fetch())
                 if snippets:
-                    logger.info(f"Using transcript: lang={t.language_code}")
+                    logger.info("Strategy 1 success: manual English transcript")
                     return snippets
-            except Exception:
-                continue
+            except Exception as e:
+                logger.warning(f"Strategy 1 fetch failed ({t.language_code}): {type(e).__name__}: {e}")
 
-    except Exception as e:
-        logger.debug(f"list_transcripts failed: {e}")
+    # 2. Auto-generated English
+    for t in all_transcripts:
+        if t.is_generated and t.language_code.startswith("en"):
+            try:
+                snippets = list(t.fetch())
+                if snippets:
+                    logger.info("Strategy 2 success: auto-generated English transcript")
+                    return snippets
+            except Exception as e:
+                logger.warning(f"Strategy 2 fetch failed ({t.language_code}): {type(e).__name__}: {e}")
 
-    # 4. Plain fetch fallback
+    # 3. Any transcript in any language
+    for t in all_transcripts:
+        try:
+            snippets = list(t.fetch())
+            if snippets:
+                logger.info(f"Strategy 3 success: lang={t.language_code}")
+                return snippets
+        except Exception as e:
+            logger.warning(f"Strategy 3 fetch failed ({t.language_code}): {type(e).__name__}: {e}")
+            continue
+
+    # 4. get_transcript() class-method — works with older API versions, returns plain dicts
     try:
-        api = YouTubeTranscriptApi()
-        snippets = list(api.fetch(video_id))
+        snippets = YouTubeTranscriptApi.get_transcript(video_id)
         if snippets:
-            logger.info("Fetched via plain api.fetch()")
-            return snippets
+            logger.info("Strategy 4 success: get_transcript() class method")
+            return list(snippets)
     except Exception as e:
-        logger.debug(f"Plain fetch failed: {e}")
+        logger.warning(f"Strategy 4 (get_transcript) failed: {type(e).__name__}: {e}")
 
     raise NoCaptionsError(
         "This video has no YouTube captions available. "
